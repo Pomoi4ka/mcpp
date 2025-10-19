@@ -4,7 +4,6 @@
 #include <tuple>
 #include <optional>
 #include <string>
-#include <sstream>
 #include <unordered_map>
 
 #include <cstdint>
@@ -732,6 +731,12 @@ struct ByteBuffer : std::vector<unsigned char> {
     }
 
     template <typename T>
+    void put(T value) {
+        endianswap(&value);
+        write(&value, sizeof(T));
+    }
+
+    template <typename T>
     T get_be() {
         T value;
         read(&value, sizeof(T));
@@ -754,7 +759,226 @@ struct UUID {
     uint64_t low, high;
 };
 
-struct PacketReader : BufIo {
+namespace NBT {
+    enum class TagType {
+        End,
+        Byte,
+        Short,
+        Int,
+        Long,
+        Float,
+        Double,
+        Byte_Array,
+        String,
+        List,
+        Compound,
+        Int_Array,
+        Long_Array,
+    };
+
+    class Tag {
+    public:
+        virtual ~Tag() = default;
+        TagType get_type() const {
+            return type;
+        }
+
+    protected:
+        Tag(TagType type)
+            : type(type)
+        {}
+
+        TagType type;
+    };
+
+    struct ByteArrayTag : Tag {
+        ByteArrayTag(std::vector<char> value)
+            : Tag(TagType::Byte_Array)
+            , value(value) {}
+        std::vector<char> value;
+    };
+
+    struct IntArrayTag : Tag {
+        IntArrayTag(std::vector<int> value)
+            : Tag(TagType::Int_Array)
+            , value(value) {}
+        std::vector<int> value;
+    };
+
+    struct LongArrayTag : Tag {
+        LongArrayTag(std::vector<int64_t> value)
+            : Tag(TagType::Long_Array)
+            , value(value) {}
+        std::vector<int64_t> value;
+    };
+
+    struct StringTag : Tag {
+        StringTag(std::string value)
+            : Tag(TagType::String)
+            , value(value) {}
+        std::string value;
+    };
+
+    struct ListTag : Tag {
+        ListTag(TagType list_type, std::vector<Tag *> value)
+            : Tag(TagType::List)
+            , list_type(list_type)
+            , value(value)
+        {}
+
+        ~ListTag() {
+            for (auto p : value) {
+                delete p;
+            }
+        }
+
+        TagType list_type;
+        std::vector<Tag *> value;
+    };
+
+    struct CompoundTag : Tag {
+        CompoundTag(std::unordered_map<std::string, Tag *> value)
+            : Tag(TagType::Compound)
+            , value(value) {}
+
+        ~CompoundTag() {
+            for (auto &[_, p] : value) {
+                delete p;
+            }
+        }
+
+        std::unordered_map<std::string, Tag *> value;
+    };
+
+    struct ByteTag : Tag {
+        ByteTag(char value) : Tag(TagType::Byte), value(value) {}
+        char value;
+    };
+    struct ShortTag : Tag {
+        ShortTag(short value) : Tag(TagType::Byte), value(value) {}
+        short value;
+    };
+    struct IntTag : Tag {
+        IntTag(int value) : Tag(TagType::Byte), value(value) {}
+        int value;
+    };
+    struct LongTag : Tag {
+        LongTag(long value) : Tag(TagType::Byte), value(value) {}
+        int64_t value;
+    };
+    struct FloatTag : Tag {
+        FloatTag(float value) : Tag(TagType::Byte), value(value) {}
+        float value;
+    };
+    struct DoubleTag : Tag {
+        DoubleTag(double value) : Tag(TagType::Byte), value(value) {}
+        double value;
+    };
+
+    static Tag *tag_from_bytes(ByteBuffer &bb, TagType type) {
+        switch (type) {
+        default: break;
+        case TagType::Byte: return new ByteTag(bb.get<char>());
+        case TagType::Short: return new ShortTag(bb.get<short>());
+        case TagType::Int: return new IntTag(bb.get<int>());
+        case TagType::Long: return new LongTag(bb.get<int64_t>());
+        case TagType::Float: return new FloatTag(bb.get<float>());
+        case TagType::Double: return new DoubleTag(bb.get<double>());
+        case TagType::Byte_Array: {
+            int len = bb.get<int>();
+            std::vector<char> bytes(len);
+            bb.read(bytes.data(), bytes.size());
+            return new ByteArrayTag(bytes);
+        } break;
+        case TagType::Int_Array: {
+            int len = bb.get<int>();
+            std::vector<int> value(len);
+            bb.read(value.data(), value.size());
+            return new IntArrayTag(value);
+        } break;
+        case TagType::Long_Array: {
+            int len = bb.get<int64_t>();
+            std::vector<int64_t> value(len);
+            bb.read(value.data(), value.size());
+            return new LongArrayTag(value);
+        } break;
+        case TagType::String: {
+            auto len = bb.get<unsigned short>();
+            std::string value;
+            value.resize(len);
+            bb.read(value.data(), value.size());
+            return new StringTag(value);
+        } break;
+        case TagType::List: {
+            TagType type = static_cast<TagType>(bb.get<char>());
+            auto len = bb.get<int>();
+            std::vector<Tag *> value(len);
+            for (int i = 0; i < len; ++i) {
+                value[i] = tag_from_bytes(bb, type);
+            }
+            return new ListTag(type, value);
+        } break;
+        case TagType::Compound: {
+            TagType type;
+            std::unordered_map<std::string, Tag *> value;
+            for (;;) {
+                type = static_cast<TagType>(bb.get<char>());
+                if (type == TagType::End) break;
+                auto len = bb.get<unsigned short>();
+                std::string name;
+                name.resize(len);
+                bb.read(name.data(), name.size());
+
+                value.insert({name, tag_from_bytes(bb, type)});
+            }
+            return new CompoundTag(value);
+        } break;
+        }
+        return nullptr;
+    }
+
+    static Tag *tag_from_bytes(ByteBuffer &bb) {
+        TagType type = static_cast<TagType>(bb.get<char>());
+        return tag_from_bytes(bb, type);
+    }
+
+    static void serialize_tag(const Tag *tag, ByteBuffer &bb, bool put_type = true) {
+        auto type = tag->get_type();
+
+        if (put_type) bb.put(static_cast<char>(type));
+
+        switch (type) {
+        case TagType::String: {
+            const StringTag *str = reinterpret_cast<const StringTag *>(tag);
+            auto len = str->value.size();
+            bb.put<unsigned short>(len);
+            bb.write(str->value.data(), len);
+        } break;
+        case TagType::Compound: {
+            const CompoundTag *c = reinterpret_cast<const CompoundTag *>(tag);
+            for (auto &[name, tag] : c->value) {
+                bb.put(static_cast<char>(tag->get_type()));
+                auto len = name.size();
+                bb.put<unsigned short>(len);
+                bb.write(name.data(), len);
+                serialize_tag(tag, bb, false);
+            }
+            bb.put(static_cast<char>(TagType::End));
+        } break;
+        case TagType::List: {
+            const ListTag *c = reinterpret_cast<const ListTag *>(tag);
+            bb.put(static_cast<char>(c->list_type));
+            bb.put<int>(c->value.size());
+            for (auto tag : c->value) {
+                serialize_tag(tag, bb, false);
+            }
+        } break;
+        default: assert(0 && "not implemented");
+        }
+    }
+}
+
+struct PacketStream : BufIo {
     enum class error {
         InvalidPacket,
     };
@@ -763,7 +987,7 @@ struct PacketReader : BufIo {
     ByteBuffer receive_packet_buffer;
     int compression_threshold = -1;
 
-    explicit PacketReader(BufIo::Handler *handler)
+    explicit PacketStream(BufIo::Handler *handler)
         : BufIo(handler)
         , construct_packet_buffer()
         , receive_packet_buffer()
@@ -798,6 +1022,10 @@ struct PacketReader : BufIo {
         auto &buf = construct_packet_buffer;
         push_varint(string.size());
         buf.write(string.data(), string.size());
+    }
+
+    void push_tag(const NBT::Tag *tag) {
+        NBT::serialize_tag(tag, construct_packet_buffer);
     }
 
     void push_varint(int value) {
@@ -847,90 +1075,9 @@ struct PacketReader : BufIo {
     }
 };
 
-namespace NBT {
-    enum class TagType {
-        End,
-        Byte,
-        Short,
-        Int,
-        Long,
-        Float,
-        Double,
-        Byte_Array,
-        String,
-        List,
-        Compound,
-        Int_Array,
-        Long_Array,
-    };
-
-    class Tag {
-    protected:
-        Tag(TagType type)
-            : type(type)
-        {}
-
-        TagType type;
-        virtual ~Tag() = default;
-    };
-
-    struct ByteArrayTag : Tag {
-        ByteArrayTag(std::vector<char> value)
-            : Tag(TagType::Byte_Array)
-            , value(value) {}
-        std::vector<char> value;
-    };
-
-    struct IntArrayTag : Tag {
-        IntArrayTag(std::vector<int> value)
-            : Tag(TagType::Int_Array)
-            , value(value) {}
-        std::vector<int> value;
-    };
-
-    struct LongArrayTag : Tag {
-        LongArrayTag(std::vector<int64_t> value)
-            : Tag(TagType::Long_Array)
-            , value(value) {}
-        std::vector<int64_t> value;
-    };
-
-    struct StringTag : Tag {
-        StringTag(std::string value)
-            : Tag(TagType::String)
-            , value(value) {}
-        std::string value;
-    };
-
-    struct ByteTag : Tag {
-        ByteTag(char value) : Tag(TagType::Byte), value(value) {}
-        char value;
-    };
-    class ShortTag : Tag {
-        ShortTag(short value) : Tag(TagType::Byte), value(value) {}
-        short value;
-    };
-    class IntTag : Tag {
-        IntTag(int value) : Tag(TagType::Byte), value(value) {}
-        int value;
-    };
-    class LongTag : Tag {
-        LongTag(long value) : Tag(TagType::Byte), value(value) {}
-        int64_t value;
-    };
-    class FloatTag : Tag {
-        FloatTag(float value) : Tag(TagType::Byte), value(value) {}
-        float value;
-    };
-    class DoubleTag : Tag {
-        DoubleTag(double value) : Tag(TagType::Byte), value(value) {}
-        double value;
-    };
-}
-
 struct Connection
     : Coroutine
-    , PacketReader
+    , PacketStream
 {
     enum class State {
         Handshake,
@@ -940,37 +1087,61 @@ struct Connection
 
     explicit Connection() noexcept
         : Coroutine()
-        , PacketReader(&sock)
+        , PacketStream(&sock)
         , sock(this, 30000)
     {}
 
+    void exit() {
+        shutdown(sock.fd, SHUT_RD);
+        awaiter.set_events(POLLIN|POLLHUP);
+        await();
+        Coroutine::exit();
+    }
+
     void not_implemented(std::string_view func = "") {
-        int id;
 
         switch (state) {
         case State::Handshake:
-        case State::Login:
-            id = 0x00; break;
-        case State::Configuration:
-            id = 0x02; break;
-        }
-
-        packet_begin(id);
-        if (func.size()) {
-            std::stringstream ss;
-            ss << "{\"text\": \"Not implemented: " << func << "\"}";
-            push_string(ss.str());
-        } else {
-            push_string("{\"text\": \"Not implemented\"}");
+        case State::Login: {
+            std::string ans = "{\"text\": \"Not implemented\"}";
+            if (func.size()) {
+                ans = "{\"text\": \"Not implemented: ";
+                ans += func;
+                ans += "\"}";
+            }
+            packet_begin(0x00);
+            push_string(ans);
+        } break;
+        case State::Configuration: {
+            packet_begin(0x02);
+            NBT::Tag *tag;
+            if (func.size()) {
+                using namespace NBT;
+                tag = new CompoundTag({
+                        {"text", new StringTag("Not implemented: ")},
+                        {"extra",
+                         new ListTag(TagType::Compound, {
+                                 new CompoundTag({
+                                         {"text", new StringTag(std::string{func})},
+                                         {"color", new StringTag("red")}
+                                     })
+                             })}
+                    });
+            } else {
+                tag = new NBT::StringTag("Not implemented");
+            }
+            push_tag(tag);
+            delete tag;
+        } break;
         }
         packet_end();
+
         exit();
     }
 
     void state_login() {
         int id = receive_packet();
         switch (id) {
-
         case 0x00: {
             auto name = get_string(); // Player name
             auto uuid = get_uuid();
@@ -986,8 +1157,6 @@ struct Connection
             state = State::Configuration;
             break;
         }
-
-        not_implemented("state_login");
     }
 
     void state_handshake() {
