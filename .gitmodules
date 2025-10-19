@@ -1,0 +1,3 @@
+[submodule "libco"]
+	path = libco
+	url = https://github.com/M0x1m/libco.git
