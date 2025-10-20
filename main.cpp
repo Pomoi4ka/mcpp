@@ -5,6 +5,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <sstream>
 
 #include <cstdint>
 #include <cassert>
@@ -1083,6 +1084,7 @@ struct Connection
         Handshake,
         Login,
         Configuration,
+        Play
     };
 
     explicit Connection() noexcept
@@ -1092,14 +1094,15 @@ struct Connection
     {}
 
     void exit() {
-        shutdown(sock.fd, SHUT_RD);
-        awaiter.set_events(POLLIN|POLLHUP);
-        await();
+        shutdown(sock.fd, SHUT_WR);
+        for (;;) try {
+            char buf;
+            read(&buf, sizeof buf);
+        } catch (...) { break; }
         Coroutine::exit();
     }
 
     void not_implemented(std::string_view func = "") {
-
         switch (state) {
         case State::Handshake:
         case State::Login: {
@@ -1112,27 +1115,28 @@ struct Connection
             packet_begin(0x00);
             push_string(ans);
         } break;
-        case State::Configuration: {
-            packet_begin(0x02);
-            NBT::Tag *tag;
-            if (func.size()) {
+            int id;
+            do { // This is cursed
+        case State::Configuration: id = 0x02; break;
+        case State::Play: id = 0x1c; break;
+            } while (0);
+            {
+                packet_begin(id);
                 using namespace NBT;
-                tag = new CompoundTag({
-                        {"text", new StringTag("Not implemented: ")},
-                        {"extra",
-                         new ListTag(TagType::Compound, {
-                                 new CompoundTag({
-                                         {"text", new StringTag(std::string{func})},
-                                         {"color", new StringTag("red")}
-                                     })
-                             })}
-                    });
-            } else {
-                tag = new NBT::StringTag("Not implemented");
-            }
-            push_tag(tag);
-            delete tag;
-        } break;
+                Tag *tag;
+                if (func.size()) {
+                    tag = new CompoundTag({
+                            {"text", new StringTag("Not implemented: ")},
+                            {"extra", new ListTag(TagType::Compound, {
+                                        new CompoundTag({
+                                                {"text", new StringTag(std::string{func})},
+                                                {"color", new StringTag("red")}})})}});
+                } else {
+                    tag = new StringTag("Not implemented");
+                }
+                push_tag(tag);
+                delete tag;
+            } break;
         }
         packet_end();
 
@@ -1175,12 +1179,39 @@ struct Connection
         }
     }
 
+    void state_configuration() {
+        int id = receive_packet();
+        switch (id) {
+        case 0x00: {
+            // Dont care
+            // get_string(); // locale
+            // get<char>(); // view distance
+            // get_varint(); // chat mode
+            // get<bool>(); // chat colors
+            // get<char>(); // skin parts
+            // get_varint(); // main hand
+            // get<bool>(); // text filtering
+            // get<bool>(); // allow server listing
+            // get_varint(); // particle status
+            packet_begin(0x03);
+            packet_end();
+        } break;
+        case 0x03: state = State::Play; break;
+        case 0x02: {
+            auto identifier = get_string();
+            print("Plugin message: ", identifier);
+        } break;
+        default: not_implemented((std::stringstream() << id).str());
+        }
+    }
+
     void state_router() {
         while (true) {
             switch (state) {
             case State::Handshake: state_handshake(); break;
             case State::Login: state_login(); break;
-            case State::Configuration: not_implemented("Configuration"); break;
+            case State::Configuration: state_configuration(); break;
+            case State::Play: not_implemented("Play"); break;
             }
         }
     }
@@ -1189,7 +1220,9 @@ struct Connection
         this->sock.fd = sock;
         print("Accepted ", inet_ntoa(addr.sin_addr), ":", ntohs(addr.sin_port));
 
-        state_router();
+        try {
+            state_router();
+        } catch (...) {}
     }
 protected:
     AsyncSocket sock;
