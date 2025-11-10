@@ -7,6 +7,10 @@
 #include <unordered_map>
 #include <sstream>
 
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+
 #include <cstdint>
 #include <cassert>
 #include <cstring>
@@ -21,11 +25,14 @@
 #include <libco.h>
 #include <zlib.h>
 
+#include "registries.hpp"
+
 const size_t COROUTINE_STACK_CAP = 65536;
 
 struct EventLoop;
 struct Coroutine;
 
+[[maybe_unused]]
 static std::vector<unsigned char> compress_bytes(void *bytes, size_t n)
 {
     std::vector<unsigned char> result;
@@ -53,6 +60,7 @@ static std::vector<unsigned char> compress_bytes(void *bytes, size_t n)
     return result;
 }
 
+[[maybe_unused]]
 static std::vector<unsigned char> uncompress_bytes(void *bytes, size_t n)
 {
     std::vector<unsigned char> result;
@@ -567,15 +575,16 @@ struct BufIo {
 
     void fetch() {
         size_t avail = readbuf.size() - readpos;
-        int ret = handler->read(&readbuf[readpos], avail);
+        int ret = handler->read(readbuf.data() + readpos, avail);
         readavail += ret;
     }
 
     void flush(int flush_all = 1) {
-        while (flush_all && writeavail) {
+        while (writeavail) {
             size_t pos = writepos - writeavail;
             int ret = handler->write(&writebuf[pos], writeavail);
             writeavail -= ret;
+            if (!flush_all) break;
         }
         writepos %= writebuf.size();
     }
@@ -584,10 +593,10 @@ struct BufIo {
         unsigned int off = 0;
         auto buf = reinterpret_cast<const unsigned char*>(src);
         while ((int)off < n) {
-            if (writeavail == writebuf.size()) flush(0);
+            if (writepos == writebuf.size()) flush(0);
             unsigned int avail = writebuf.size() - writepos;
             unsigned int to_copy = std::min(n - off, avail);
-            memcpy(&writebuf[writepos], buf + off, to_copy);
+            memcpy(writebuf.data() + writepos, buf + off, to_copy);
             off += to_copy;
             writeavail += to_copy;
             writepos += to_copy;
@@ -814,6 +823,10 @@ namespace NBT {
     };
 
     struct StringTag : Tag {
+        StringTag()
+            : StringTag("")
+        {}
+
         StringTag(std::string value)
             : Tag(TagType::String)
             , value(value) {}
@@ -827,10 +840,26 @@ namespace NBT {
             , value(value)
         {}
 
+        ListTag(ListTag &&other)
+            : Tag(std::move(other))
+            , list_type(other.list_type)
+            , value(std::move(other.value))
+        {}
+
+        ListTag(TagType list_type)
+            : ListTag(list_type, {})
+        {}
+
         ~ListTag() {
-            for (auto p : value) {
-                delete p;
-            }
+            for (auto p : value) delete p;
+        }
+
+        template <typename T>
+        ListTag *add(T &&tag) {
+            assert(tag.get_type() == list_type);
+
+            value.push_back(new std::remove_reference_t<T>(std::move(tag)));
+            return this;
         }
 
         TagType list_type;
@@ -838,17 +867,31 @@ namespace NBT {
     };
 
     struct CompoundTag : Tag {
-        CompoundTag(std::unordered_map<std::string, Tag *> value)
+        using container = std::unordered_map<std::string, Tag *>;
+        CompoundTag(container value)
             : Tag(TagType::Compound)
             , value(value) {}
 
+        CompoundTag(CompoundTag &&other)
+            : Tag(std::move(other))
+            , value(std::move(other.value))
+        {}
+
+        CompoundTag()
+            : CompoundTag(container{})
+        {}
+
         ~CompoundTag() {
-            for (auto &[_, p] : value) {
-                delete p;
-            }
+            for (auto &[_, p] : value) delete p;
         }
 
-        std::unordered_map<std::string, Tag *> value;
+        template <typename T>
+        CompoundTag *add(std::string_view sv, T &&tag) {
+            value.insert({std::string(sv), static_cast<Tag *>(new std::remove_reference_t<T>(std::move(tag)))});
+            return this;
+        }
+
+        container value;
     };
 
     struct ByteTag : Tag {
@@ -856,23 +899,23 @@ namespace NBT {
         char value;
     };
     struct ShortTag : Tag {
-        ShortTag(short value) : Tag(TagType::Byte), value(value) {}
+        ShortTag(short value) : Tag(TagType::Short), value(value) {}
         short value;
     };
     struct IntTag : Tag {
-        IntTag(int value) : Tag(TagType::Byte), value(value) {}
+        IntTag(int value) : Tag(TagType::Int), value(value) {}
         int value;
     };
     struct LongTag : Tag {
-        LongTag(long value) : Tag(TagType::Byte), value(value) {}
+        LongTag(long value) : Tag(TagType::Long), value(value) {}
         int64_t value;
     };
     struct FloatTag : Tag {
-        FloatTag(float value) : Tag(TagType::Byte), value(value) {}
+        FloatTag(float value) : Tag(TagType::Float), value(value) {}
         float value;
     };
     struct DoubleTag : Tag {
-        DoubleTag(double value) : Tag(TagType::Byte), value(value) {}
+        DoubleTag(double value) : Tag(TagType::Double), value(value) {}
         double value;
     };
 
@@ -938,6 +981,7 @@ namespace NBT {
         return nullptr;
     }
 
+    [[maybe_unused]]
     static Tag *tag_from_bytes(ByteBuffer &bb) {
         TagType type = static_cast<TagType>(bb.get<char>());
         return tag_from_bytes(bb, type);
@@ -974,10 +1018,40 @@ namespace NBT {
                 serialize_tag(tag, bb, false);
             }
         } break;
+        case TagType::Int: {
+            const IntTag *c = reinterpret_cast<const IntTag *>(tag);
+            bb.put<int>(c->value);
+        } break;
+        case TagType::Byte: {
+            const ByteTag *c = reinterpret_cast<const ByteTag *>(tag);
+            bb.put<char>(c->value);
+        } break;
+        case TagType::Double: {
+            const DoubleTag *c = reinterpret_cast<const DoubleTag *>(tag);
+            bb.put<double>(c->value);
+        } break;
+        case TagType::Float: {
+            const FloatTag *c = reinterpret_cast<const FloatTag *>(tag);
+            bb.put<float>(c->value);
+        } break;
         default: assert(0 && "not implemented");
         }
     }
 }
+
+struct World {
+protected:
+public:
+    int join_player() {
+        return 1;
+    }
+
+    static void world_thread(World &)
+    {
+        char blocks[4096];
+        memset(blocks, 1, sizeof blocks);
+    }
+};
 
 struct PacketStream : BufIo {
     enum class error {
@@ -988,11 +1062,7 @@ struct PacketStream : BufIo {
     ByteBuffer receive_packet_buffer;
     int compression_threshold = -1;
 
-    explicit PacketStream(BufIo::Handler *handler)
-        : BufIo(handler)
-        , construct_packet_buffer()
-        , receive_packet_buffer()
-    {}
+    explicit PacketStream(BufIo::Handler *handler);
 
     template <typename T>
     T get() {
@@ -1002,36 +1072,12 @@ struct PacketStream : BufIo {
         return value;
     }
 
-    void packet_begin(int packet_id) {
-        construct_packet_buffer.clear();
-        construct_packet_buffer.pos = 0;
-        Varint::write(construct_packet_buffer, packet_id);
-    }
-
-    void packet_end() {
-        const auto &buf = construct_packet_buffer;
-        if (compression_threshold < 0) {
-            Varint::write(*this, buf.size());
-            write(buf.data(), buf.size());
-            flush();
-        } else {
-            assert(0 && "not implemented");
-        }
-    }
-
-    void push_string(std::string_view string) {
-        auto &buf = construct_packet_buffer;
-        push_varint(string.size());
-        buf.write(string.data(), string.size());
-    }
-
-    void push_tag(const NBT::Tag *tag) {
-        NBT::serialize_tag(tag, construct_packet_buffer);
-    }
-
-    void push_varint(int value) {
-        Varint::write(construct_packet_buffer, value);
-    }
+    struct PacketBuilder packet(int id);
+    void packet_begin(int packet_id);
+    void packet_end();
+    void push_string(std::string_view string);
+    void push_tag(const NBT::Tag *tag);
+    void push_varint(int value);
 
     template <typename T>
     void push(T value) {
@@ -1039,42 +1085,145 @@ struct PacketStream : BufIo {
         construct_packet_buffer.write(&value, sizeof(T));
     }
 
-    void push_uuid(UUID uuid) {
-        push(uuid.high);
-        push(uuid.low);
-    }
-
-    int get_varint() {
-        return Varint::read(receive_packet_buffer);
-    }
-
-    UUID get_uuid() {
-        UUID result;
-        receive_packet_buffer.read(&result, sizeof result);
-        endianswap(&result);
-        return result;
-    }
-
-    std::string_view get_string() {
-        size_t len = get_varint();
-        const char *data = reinterpret_cast<const char *>(receive_packet_buffer.front());
-        receive_packet_buffer.pos += len;
-        return {data, len};
-    }
-
-    int receive_packet() {
-        int length = Varint::read(*this);
-        if (length < 0) throw error::InvalidPacket;
-        receive_packet_buffer.pos = 0;
-        receive_packet_buffer.resize(length);
-        read(receive_packet_buffer.data(), length);
-        if (compression_threshold < 0) {
-            return get_varint();
-        } else {
-            assert(0 && "not implemented");
-        }
-    }
+    void push_uuid(UUID uuid);
+    int get_varint();
+    UUID get_uuid();
+    std::string_view get_string();
+    int receive_packet();
 };
+
+struct PacketBuilder {
+    using Self = PacketBuilder;
+
+    PacketBuilder(struct PacketStream *strm, int id);
+    void build() const;
+    Self &varint(int v);
+    Self &string(std::string_view sv);
+    Self &bytes(const void *, size_t n);
+    template <typename T>
+    Self &add(T val) {
+        strm.template push<T>(val);
+        return *this;
+    }
+    Self &tag(NBT::Tag &&);
+    Self &tag(NBT::Tag const &);
+
+private:
+    PacketStream &strm;
+};
+
+PacketStream::PacketStream(BufIo::Handler *handler)
+    : BufIo(handler)
+    , construct_packet_buffer()
+    , receive_packet_buffer()
+{}
+
+PacketBuilder PacketStream::packet(int id) {
+    return PacketBuilder(this, id);
+}
+
+void PacketStream::packet_begin(int packet_id) {
+    construct_packet_buffer.clear();
+    construct_packet_buffer.pos = 0;
+    Varint::write(construct_packet_buffer, packet_id);
+}
+
+void PacketStream::packet_end() {
+    const auto &buf = construct_packet_buffer;
+    if (compression_threshold < 0) {
+        Varint::write(*this, buf.size());
+        write(buf.data(), buf.size());
+        flush();
+    } else {
+        assert(0 && "not implemented");
+    }
+}
+
+void PacketStream::push_string(std::string_view string) {
+    auto &buf = construct_packet_buffer;
+    push_varint(string.size());
+    buf.write(string.data(), string.size());
+}
+
+void PacketStream::push_tag(const NBT::Tag *tag) {
+    NBT::serialize_tag(tag, construct_packet_buffer);
+}
+
+void PacketStream::push_varint(int value) {
+    Varint::write(construct_packet_buffer, value);
+}
+
+void PacketStream::push_uuid(UUID uuid) {
+    push(uuid.high);
+    push(uuid.low);
+}
+
+int PacketStream::get_varint() {
+    return Varint::read(receive_packet_buffer);
+}
+
+UUID PacketStream::get_uuid() {
+    UUID result;
+    receive_packet_buffer.read(&result, sizeof result);
+    endianswap(&result);
+    return result;
+}
+
+std::string_view PacketStream::get_string() {
+    size_t len = get_varint();
+    const char *data = reinterpret_cast<const char *>(receive_packet_buffer.front());
+    receive_packet_buffer.pos += len;
+    return {data, len};
+}
+
+int PacketStream::receive_packet() {
+    int length = Varint::read(*this);
+    if (length < 0) throw error::InvalidPacket;
+    receive_packet_buffer.pos = 0;
+    receive_packet_buffer.resize(length);
+    read(receive_packet_buffer.data(), length);
+    if (compression_threshold < 0) {
+        return get_varint();
+    } else {
+        assert(0 && "not implemented");
+    }
+}
+
+PacketBuilder::PacketBuilder(PacketStream *strm, int id)
+    : strm(*strm)
+{
+    strm->packet_begin(id);
+}
+
+void PacketBuilder::build() const
+{
+    strm.packet_end();
+}
+
+PacketBuilder &PacketBuilder::varint(int v) {
+    strm.push_varint(v);
+    return *this;
+}
+
+PacketBuilder &PacketBuilder::bytes(const void *bytes, size_t n) {
+    strm.construct_packet_buffer.write(bytes, n);
+    return *this;
+}
+
+PacketBuilder &PacketBuilder::string(std::string_view sv) {
+    strm.push_string(sv);
+    return *this;
+}
+
+PacketBuilder &PacketBuilder::tag(NBT::Tag &&tag) {
+    strm.push_tag(&tag);
+    return *this;
+}
+
+PacketBuilder &PacketBuilder::tag(NBT::Tag const &tag) {
+    strm.push_tag(&tag);
+    return *this;
+}
 
 struct Connection
     : Coroutine
@@ -1119,23 +1268,22 @@ struct Connection
             do { // This is cursed
         case State::Configuration: id = 0x02; break;
         case State::Play: id = 0x1c; break;
-            } while (0);
-            {
+            } while (0); {
                 packet_begin(id);
                 using namespace NBT;
-                Tag *tag;
+                using namespace std::string_literals;
                 if (func.size()) {
-                    tag = new CompoundTag({
-                            {"text", new StringTag("Not implemented: ")},
-                            {"extra", new ListTag(TagType::Compound, {
-                                        new CompoundTag({
-                                                {"text", new StringTag(std::string{func})},
-                                                {"color", new StringTag("red")}})})}});
+                    push_tag(CompoundTag{}
+                            .add<StringTag>("text", "Not implemented: "s)
+                            ->add<ListTag&>("extra", *ListTag{TagType::Compound}
+                                .add<CompoundTag&>(*CompoundTag{}
+                                    .add<StringTag>("text", std::string(func))
+                                    ->add<StringTag>("color", "red"s)
+                                    )));
                 } else {
-                    tag = new StringTag("Not implemented");
+                    StringTag t{"Not implemented"};
+                    push_tag(&t);
                 }
-                push_tag(tag);
-                delete tag;
             } break;
         }
         packet_end();
@@ -1163,6 +1311,15 @@ struct Connection
         }
     }
 
+    void print_conbuf() const
+    {
+        for (auto x : construct_packet_buffer) {
+            if (isprint(x)) printf("%c", x);
+            else printf("%02x ", x);
+        }
+        printf("\n\n");
+    }
+
     void state_handshake() {
         int id = receive_packet();
         switch (id) {
@@ -1179,6 +1336,8 @@ struct Connection
         }
     }
 
+    void registry_data();
+
     void state_configuration() {
         int id = receive_packet();
         switch (id) {
@@ -1193,14 +1352,70 @@ struct Connection
             // get<bool>(); // text filtering
             // get<bool>(); // allow server listing
             // get_varint(); // particle status
+
+            packet(0x0c)
+                .varint(1)
+                .string("minecraft:vanilla")
+                .build();
+
+            packet(0x0e)
+                .varint(1)
+                .string("minecraft")
+                .string("core")
+                .string("1.21.8")
+                .build();
+
+            registry_data();
+
             packet_begin(0x03);
             packet_end();
         } break;
         case 0x03: state = State::Play; break;
+        case 0x07: break; // Client known packs: dont care
         case 0x02: {
             auto identifier = get_string();
             print("Plugin message: ", identifier);
         } break;
+        default: not_implemented((std::stringstream() << id).str());
+        }
+    }
+
+    void state_play() {
+        if (!play_login_sent) {
+            int eid = world->join_player();
+
+            packet_begin(0x2b);
+            push<int>(eid);
+            push<bool>(false); // Hardcore
+            push_varint(3); {
+                push_string("minecraft:overworld"); // Dimension names
+                push_string("minecraft:the_nether"); // Dimension names
+                push_string("minecraft:the_end"); // Dimension names
+            }
+            push_varint(0x14); // Max players
+            push_varint(0xa); // View distance
+            push_varint(0xa); // Sim distance
+            push<bool>(false); // reduced debug info
+            push<bool>(true); // Respawn screen
+            push<bool>(false); // limited crafting
+            push_varint(0); // Dim type
+            push_string("minecraft:overworld"); // Dim name
+            push<uint64_t>(0); // Hashed seed
+            push<char>(0); // Gamemode
+            push<char>(-1); // prev Gamemode
+            push<bool>(false); // debug
+            push<bool>(false); // flat
+            push<bool>(false); // death loc
+            push_varint(0); // Portal cooldown
+            push_varint('?'); // sea level
+            push<bool>(false); // enforce secure chat
+            packet_end();
+            play_login_sent = true;
+        }
+
+        int id = receive_packet();
+        switch (id) {
+        case 0x0c: break; // Client tick end, don't care
         default: not_implemented((std::stringstream() << id).str());
         }
     }
@@ -1211,13 +1426,14 @@ struct Connection
             case State::Handshake: state_handshake(); break;
             case State::Login: state_login(); break;
             case State::Configuration: state_configuration(); break;
-            case State::Play: not_implemented("Play"); break;
+            case State::Play: state_play(); break;
             }
         }
     }
 
-    void create(int sock, sockaddr_in addr) noexcept {
+    void create(int sock, sockaddr_in addr, World &world) noexcept {
         this->sock.fd = sock;
+        this->world = &world;
         print("Accepted ", inet_ntoa(addr.sin_addr), ":", ntohs(addr.sin_port));
 
         try {
@@ -1227,7 +1443,164 @@ struct Connection
 protected:
     AsyncSocket sock;
     State state = State::Handshake;
+    World *world;
+    bool play_login_sent = false;
 };
+
+void Connection::registry_data()
+{
+    using namespace RegistryData;
+    using namespace std::string_literals;
+    using namespace NBT;
+
+    packet(0x07)
+        .bytes(world_gen_biome, std::size(world_gen_biome) - 1)
+        .build();
+
+    for (auto [name, model] : thermal_variants) {
+        auto p = packet(0x07)
+            .string("minecraft:"s + name + "_variant")
+            .varint(std::size(thermal_zones));
+
+        for (size_t i = 0; i < std::size(thermal_zones); ++i) {
+            auto var = thermal_zones[i];
+            p.string("minecraft:"s + var);
+            p.add<bool>(true);
+            CompoundTag tag;
+            if (model[i]) tag.add<StringTag>("model", {var});
+            tag.add<StringTag>("asset_id", "minecraft:entity/"s + name + "/" + var + "_" + name);
+            p.tag(tag);
+        }
+
+        p.build();
+    }
+
+    auto p = packet(0x07)
+        .string("minecraft:cat_variant")
+        .varint(std::size(cats));
+    for (auto cat : cats) {
+        p.string("minecraft:"s + cat);
+        p.add<bool>(true);
+        p.tag(*CompoundTag()
+              .add<StringTag>("asset_id", "minecraft:enitity/cat/"s + cat));
+    }
+    p.build();
+
+    {
+        auto p = packet(0x07)
+            .string("minecraft:painting_variant")
+            .varint(std::size(paintings));
+
+        for (auto paint : paintings) {
+            auto name = paint.name;
+            auto width = paint.width;
+            auto height = paint.height;
+
+            CompoundTag tag;
+
+            if (paint.authored) {
+                tag.add("author", *CompoundTag()
+                        .add<StringTag>("color", "gray"s)
+                        ->add<StringTag>("translate", "painting.minecraft."s + name + ".author"));
+            }
+
+            tag.add<IntTag>("width", width)
+                ->add<IntTag>("height", height)
+                ->add<StringTag>("asset_id", "minecraft:"s + name)
+                ->add("title", *CompoundTag()
+                      .add<StringTag>("color", "yellow"s)
+                      ->add<StringTag>("translate", "painting.minecraft."s + name + ".title"));
+
+            p.string("minecraft:"s + name)
+                .add<bool>(true)
+                .tag(tag);
+        }
+
+        p.build();
+    }
+
+    {
+        auto p = packet(0x07)
+            .string("minecraft:wolf_sound_variant")
+            .varint(std::size(wolf_sound_variants));
+        for (auto var : wolf_sound_variants) {
+            p.string("minecraft:"s + var);
+            p.add<bool>(true);
+
+            CompoundTag tag;
+            for (auto sound : wolf_sounds) {
+                std::string t;
+                if (strcmp(var, "classic") == 0) {
+                    t += "minecraft:entity.wolf";
+                } else {
+                    t += "minecraft:entity.wolf_"s + var;
+                }
+                t += "."s + sound;
+                tag.add<StringTag>(sound + "_sound"s, t);
+            }
+
+            p.tag(tag);
+        }
+        p.build();
+    }
+
+    {
+        auto p = packet(0x07)
+            .string("minecraft:wolf_variant")
+            .varint(std::size(wolves));
+
+        for (auto w : wolves) {
+            CompoundTag assets;
+
+            p.string("minecraft:"s + w);
+            p.add<bool>(true);
+
+            for (auto s : wolf_statuses) {
+                auto name = "minecraft:enitiy/wolf/wolf_"s + w + "/wolf_" + w;
+                if (strcmp(s, "wild") != 0) name += "_"s + s;
+                assets.add<StringTag>(s, name);
+            }
+
+            p.tag(*CompoundTag()
+                  .add("assets", assets));
+        }
+
+        p.build();
+    }
+
+    packet(0x07)
+        .bytes(damage_type, std::size(damage_type) - 1)
+        .build();
+
+    packet(0x07)
+        .string("minecraft:dimension_type")
+        .varint(1)
+        .string("minecraft:overworld")
+        .add<bool>(true)
+        .tag(*CompoundTag()
+             .add<StringTag>("effects", "minecraft:overworld"s)
+             ->add<IntTag>("height", 256)
+             ->add<IntTag>("logical_height", 256)
+             ->add<IntTag>("cloud_height", 256)
+             ->add<IntTag>("min_y", 0)
+             ->add<ByteTag>("has_ceiling", 0)
+             ->add<ByteTag>("natural", 1)
+             ->add<ByteTag>("bed_works", 1)
+             ->add<ByteTag>("has_raids", 1)
+             ->add<ByteTag>("has_skylight", 1)
+             ->add<ByteTag>("piglin_safe", 0)
+             ->add<ByteTag>("ultrawarm", 0)
+             ->add<ByteTag>("respawn_anchor_works", 0)
+             ->add<StringTag>("infiniburn", "#minecraft:infiniburn_overworld"s)
+             ->add<DoubleTag>("coordinate_scale", 1)
+             ->add<FloatTag>("ambient_light", 0)
+             ->add<IntTag>("monster_spawn_block_light_limit", 0)
+             ->add("monster_spawn_light_level", *CompoundTag()
+                   .add<IntTag>("min_inclusive", 0)
+                   ->add<IntTag>("max_inclusive", 7)
+                   ->add<StringTag>("type", "uniform"s)))
+        .build();
+}
 
 struct Listener : Coroutine {
     int fd;
@@ -1236,7 +1609,7 @@ struct Listener : Coroutine {
         close(fd);
     }
 
-    void listen(int port) noexcept {
+    void listen(int port, World &world) noexcept {
         fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
         if (fd < 0) {
             eprint("Failed to create socket: ", strerror(errno));
@@ -1273,15 +1646,18 @@ struct Listener : Coroutine {
                 return;
             }
 
-            event_loop->add_ctx(&Connection::create, sock, addr);
+            event_loop->add_ctx(&Connection::create, sock, addr, std::ref(world));
         }
     }
 };
 
 int main()
 {
+    World world;
+    std::thread(World::world_thread, std::ref(world)).detach();
+
     auto event_loop = EventLoop();
-    event_loop.add_ctx(&Listener::listen, 6969);
+    event_loop.add_ctx(&Listener::listen, 6969, std::ref(world));
     event_loop.run();
 
     return 0;
